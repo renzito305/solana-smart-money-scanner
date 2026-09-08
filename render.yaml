@@ -13,3 +13,13 @@ services:
         value: "500"
       - key: MIN_LIQUIDITY_USD
         value: "100000"
+      - key: SIGNAL_SCORE_THRESHOLD
+        value: "75"
+      - key: PAPER_POSITION_USD
+        value: "25"
+      - key: PAPER_MAX_OPEN
+        value: "5"
+      - key: PAPER_TAKE_PROFIT_PCT
+        value: "20"
+      - key: PAPER_STOP_LOSS_PCT
+        value: "10"
