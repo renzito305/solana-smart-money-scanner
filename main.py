@@ -11,7 +11,7 @@ HELIUS_WEBHOOK_SECRET=os.getenv('HELIUS_WEBHOOK_SECRET','')
 DATABASE_URL=os.getenv('DATABASE_URL','sqlite:///smart_money.db')
 PAPER_STARTING_CASH=float(os.getenv('PAPER_STARTING_CASH','500'))
 MIN_LIQUIDITY_USD=float(os.getenv('MIN_LIQUIDITY_USD','100000'))
-SIGNAL_SCORE_THRESHOLD=int(os.getenv('SIGNAL_SCORE_THRESHOLD','75'))
+SIGNAL_SCORE_THRESHOLD=int(os.getenv('SIGNAL_SCORE_THRESHOLD','65'))
 PAPER_POSITION_USD=float(os.getenv('PAPER_POSITION_USD','25'))
 PAPER_MAX_OPEN=int(os.getenv('PAPER_MAX_OPEN','5'))
 PAPER_TAKE_PROFIT_PCT=float(os.getenv('PAPER_TAKE_PROFIT_PCT','20'))
@@ -23,7 +23,7 @@ elif DATABASE_URL.startswith('postgresql://') and '+psycopg' not in DATABASE_URL
     DATABASE_URL='postgresql+psycopg://'+DATABASE_URL[len('postgresql://'):]
 
 engine=create_engine(DATABASE_URL,pool_pre_ping=True,future=True)
-app=FastAPI(title='Solana Smart-Money Scanner V2.5')
+app=FastAPI(title='Solana Smart-Money Scanner V2.6')
 
 def sqlite(): return DATABASE_URL.startswith('sqlite')
 
@@ -267,8 +267,11 @@ def signal_score(ws,liq,conf):
     s=int(max(0,min(100,round(s))))
     return s,'HIGH' if s>=80 else 'MEDIUM' if s>=65 else 'LOW'
 
-def open_paper(signal_id,mint,price,score):
+def open_paper(signal_id,mint,price,score,liquidity):
+    # V2.6: MEDIUM/HIGH signals are eligible at 65+, but paper trades
+    # still require the configured minimum liquidity.
     if score<SIGNAL_SCORE_THRESHOLD or not price: return
+    if float(liquidity or 0)<MIN_LIQUIDITY_USD: return
     if one("SELECT COUNT(*) n FROM paper_positions WHERE status='OPEN'")['n']>=PAPER_MAX_OPEN: return
     if one("SELECT COUNT(*) n FROM paper_positions WHERE status='OPEN' AND token_mint=:m",{'m':mint})['n']: return
     realized=float(one("SELECT COALESCE(SUM(realized_pnl),0) x FROM paper_positions WHERE status='CLOSED'")['x'] or 0)
@@ -306,13 +309,18 @@ def process_events(events):
                 if one('SELECT COUNT(*) n FROM signals WHERE signature=:s AND wallet_address=:w AND token_mint=:m',{'s':sig,'w':w['address'],'m':mint})['n']: continue
                 try: md=market(mint)
                 except Exception: md={'price':None,'liquidity':None}
-                if sqlite(): recent=one("SELECT COUNT(DISTINCT wallet_address) n FROM signals WHERE token_mint=:m AND created_at>=datetime('now','-60 minutes')",{'m':mint})['n']
-                else: recent=one("SELECT COUNT(DISTINCT wallet_address) n FROM signals WHERE token_mint=:m AND created_at>=CURRENT_TIMESTAMP-INTERVAL '60 minutes'",{'m':mint})['n']
+                # V2.6: confirmation means distinct OTHER watched wallets that
+                # signaled the same token within 60 minutes, plus this wallet.
+                # Repeated buys from the same wallet no longer inflate confirmation.
+                if sqlite():
+                    recent=one("SELECT COUNT(DISTINCT wallet_address) n FROM signals WHERE token_mint=:m AND wallet_address<>:w AND created_at>=datetime('now','-60 minutes')",{'m':mint,'w':w['address']})['n']
+                else:
+                    recent=one("SELECT COUNT(DISTINCT wallet_address) n FROM signals WHERE token_mint=:m AND wallet_address<>:w AND created_at>=CURRENT_TIMESTAMP-INTERVAL '60 minutes'",{'m':mint,'w':w['address']})['n']
                 conf=max(1,int(recent or 0)+1); score,level=signal_score(w['wallet_score'],md.get('liquidity'),conf)
                 reason=f"wallet {w['wallet_score']}/60; 30d win {float(w['win_rate_30d'] or 0):.0%}; 90d win {float(w['win_rate_90d'] or 0):.0%}; liquidity ${float(md.get('liquidity') or 0):,.0f}; confirmation {conf}"
                 run('''INSERT INTO signals(token_mint,wallet_address,price_usd,liquidity_usd,wallet_score,confirmation_count,score,level,reason,signature,source) VALUES(:m,:w,:p,:l,:ws,:c,:s,:lv,:r,:sig,'REAL')''',{'m':mint,'w':w['address'],'p':md.get('price'),'l':md.get('liquidity'),'ws':w['wallet_score'],'c':conf,'s':score,'lv':level,'r':reason,'sig':sig})
                 sid=one('SELECT id FROM signals WHERE wallet_address=:w AND token_mint=:m ORDER BY id DESC LIMIT 1',{'w':w['address'],'m':mint})['id']
-                open_paper(sid,mint,md.get('price'),score)
+                open_paper(sid,mint,md.get('price'),score,md.get('liquidity'))
         refresh_paper()
     except Exception as e: print('webhook worker error',repr(e))
 
@@ -321,7 +329,7 @@ class WalletIn(BaseModel):
     label:str=Field(default='Watched wallet',max_length=80)
 
 @app.get('/health')
-def health(): return {'ok':True,'version':'2.3','database':'sqlite' if sqlite() else 'postgres'}
+def health(): return {'ok':True,'version':'2.6','database':'sqlite' if sqlite() else 'postgres'}
 
 @app.get('/api/wallets')
 def wallets(): return q('SELECT * FROM wallets WHERE active=1 ORDER BY created_at DESC')
@@ -426,12 +434,12 @@ def psum():
 def dash():
     return {'wallets':one('SELECT COUNT(*) n FROM wallets WHERE active=1')['n'],'signals':one("SELECT COUNT(*) n FROM signals WHERE source='REAL'")['n'],'latest':q('SELECT * FROM signals ORDER BY id DESC LIMIT 30'),'database':'SQLite (temporary)' if sqlite() else 'Postgres (persistent)'}
 
-HTML='''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Scanner V2</title><style>
+HTML='''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Scanner V2.6</title><style>
 :root{color-scheme:dark}body{margin:0;background:#0b0d10;color:#f4f4f5;font-family:system-ui}.w{max-width:1050px;margin:auto;padding:18px}.muted{color:#9ca3af}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:18px 0}.card{background:#14171c;border:1px solid #292e36;border-radius:14px;padding:14px}.m{font-size:28px;font-weight:800}.tabs{display:flex;gap:7px;margin:15px 0}.tabs button.active{outline:2px solid #f4f4f5}.clickcard{cursor:pointer}.clickcard:active{transform:scale(.99)}button{border:0;border-radius:9px;padding:9px 11px;font-weight:700}button:disabled{opacity:.55}.status{min-height:24px;margin-top:10px;font-size:13px}.smallbtn{padding:6px 8px;font-size:11px;margin:2px}.panel{display:none}.panel.on{display:block}input{width:100%;box-sizing:border-box;padding:11px;margin:5px 0;border-radius:9px;border:1px solid #343a45;background:#0d1014;color:white}table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;padding:9px 6px;border-bottom:1px solid #292e36}.pill{padding:3px 7px;border-radius:999px;font-weight:800;font-size:11px}.HIGH{background:#123a25;color:#8ef0b1}.MEDIUM{background:#3c3214;color:#f5d977}.LOW{background:#3b1b1b;color:#ffabab}.ok{color:#8ef0b1}.warn{color:#f5d977}.bad{color:#ffabab}@media(max-width:720px){.grid{grid-template-columns:repeat(2,1fr)}.hide{display:none}}
-</style></head><body><div class="w"><h1>Solana Smart-Money Scanner V2.5</h1><div class="muted">Real wallet scoring + Helius feed + $500 paper account. No live trading.</div><div id="db" style="margin-top:8px"></div><div class="grid"><div class="card clickcard" onclick="showPanel('wa')">Wallets<div class="m" id="wc">—</div></div><div class="card clickcard" onclick="showPanel('si')">Signals<div class="m" id="sc">—</div></div><div class="card clickcard" onclick="showPanel('pa')">Closed trades<div class="m" id="cc">—</div></div><div class="card clickcard" onclick="showPanel('pa')">Paper equity<div class="m" id="eq">—</div></div></div><div class="tabs"><button id="tab-wa" class="active" onclick="showPanel('wa')">Wallets</button><button id="tab-si" onclick="showPanel('si')">Signals</button><button id="tab-pa" onclick="showPanel('pa')">Paper Trades</button></div>
-<div id="wa" class="panel on"><div class="card"><h2>Add real wallet</h2><div class="muted" style="font-size:13px;margin-bottom:8px">V2.5 checks profitability + expectancy, not just win rate. Analysis may take ~5–10 seconds.</div><input id="addr" placeholder="Public Solana wallet address"><input id="label" placeholder="Label (optional)"><button id="addBtn" onclick="add()">Analyze + Add</button> <button id="birdBtn" onclick="testBird()">Test Birdeye</button><div id="feedback" class="status"></div></div><h2>Watchlist</h2><div class="card" style="overflow:auto"><table><thead><tr><th>Wallet</th><th>Score</th><th>30d</th><th>90d</th><th class="hide">30d P&L</th><th class="hide">90d P&L</th><th class="hide">Avg/trade</th><th class="hide">WAC 90d</th><th></th></tr></thead><tbody id="wr"></tbody></table></div></div>
+</style></head><body><div class="w"><h1>Solana Smart-Money Scanner V2.6</h1><div class="muted">Real wallet scoring + Helius feed + $500 paper account. No live trading.</div><div id="db" style="margin-top:8px"></div><div class="grid"><div class="card clickcard" onclick="showPanel('wa')">Wallets<div class="m" id="wc">—</div></div><div class="card clickcard" onclick="showPanel('si')">Signals<div class="m" id="sc">—</div></div><div class="card clickcard" onclick="showPanel('pa')">Closed trades<div class="m" id="cc">—</div></div><div class="card clickcard" onclick="showPanel('pa')">Paper equity<div class="m" id="eq">—</div></div></div><div class="tabs"><button id="tab-wa" class="active" onclick="showPanel('wa')">Wallets</button><button id="tab-si" onclick="showPanel('si')">Signals</button><button id="tab-pa" onclick="showPanel('pa')">Paper Trades</button></div>
+<div id="wa" class="panel on"><div class="card"><h2>Add real wallet</h2><div class="muted" style="font-size:13px;margin-bottom:8px">V2.6 checks profitability + expectancy, not just win rate. Analysis may take ~5–10 seconds.</div><input id="addr" placeholder="Public Solana wallet address"><input id="label" placeholder="Label (optional)"><button id="addBtn" onclick="add()">Analyze + Add</button> <button id="birdBtn" onclick="testBird()">Test Birdeye</button><div id="feedback" class="status"></div></div><h2>Watchlist</h2><div class="card" style="overflow:auto"><table><thead><tr><th>Wallet</th><th>Score</th><th>30d</th><th>90d</th><th class="hide">30d P&L</th><th class="hide">90d P&L</th><th class="hide">Avg/trade</th><th class="hide">WAC 90d</th><th></th></tr></thead><tbody id="wr"></tbody></table></div></div>
 <div id="si" class="panel"><h2>Signals</h2><div class="card" style="overflow:auto"><table><thead><tr><th>Level</th><th>Score</th><th>Token</th><th>Why</th></tr></thead><tbody id="sr"></tbody></table></div></div>
-<div id="pa" class="panel"><h2>Paper Trades</h2><div class="muted">$25 max · +20% take profit · -10% stop · max 5 open</div><button onclick="refreshP()" style="margin:10px 0">Refresh prices</button><div class="card" style="overflow:auto"><table><thead><tr><th>Status</th><th>Token</th><th>Entry</th><th>Current/Exit</th><th>P&L</th></tr></thead><tbody id="pr"></tbody></table></div></div></div><script>
+<div id="pa" class="panel"><h2>Paper Trades</h2><div class="muted">$25 max · 65+ score · $100K min liquidity · +20% take profit · -10% stop · max 5 open</div><button onclick="refreshP()" style="margin:10px 0">Refresh prices</button><div class="card" style="overflow:auto"><table><thead><tr><th>Status</th><th>Token</th><th>Entry</th><th>Current/Exit</th><th>P&L</th></tr></thead><tbody id="pr"></tbody></table></div></div></div><script>
 function showPanel(id){
  const target=document.getElementById(id);
  if(!target){console.error('Panel not found:',id);return}

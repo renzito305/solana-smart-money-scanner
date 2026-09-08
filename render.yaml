@@ -14,7 +14,7 @@ services:
       - key: MIN_LIQUIDITY_USD
         value: "100000"
       - key: SIGNAL_SCORE_THRESHOLD
-        value: "75"
+        value: "65"
       - key: PAPER_POSITION_USD
         value: "25"
       - key: PAPER_MAX_OPEN

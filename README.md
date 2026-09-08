@@ -1,4 +1,4 @@
-# Solana Smart-Money Scanner V2.5
+# Solana Smart-Money Scanner V2.6
 
 V2 is still paper-trading only.
 
@@ -8,9 +8,16 @@ Upgrades:
 - Wallet scoring uses measured history instead of demo numbers.
 - Helius webhook returns HTTP 200 immediately and processes events afterward.
 - Detects likely token buys and scores them using wallet quality, token liquidity and multi-wallet confirmation.
-- Qualified signals can open simulated $25 positions automatically.
+- MEDIUM/HIGH signals scoring 65+ can open simulated $25 positions automatically when liquidity is at least $100,000.
 - Default paper exits: +20% take profit / -10% stop loss, maximum 5 simultaneous positions.
 - Optional persistent PostgreSQL using the `DATABASE_URL` environment variable.
+
+## V2.6
+- Paper-entry threshold lowered from 75 to 65 so MEDIUM and HIGH signals can be tested.
+- Paper trades now enforce at least $100,000 token liquidity directly at entry.
+- Multi-wallet confirmation now counts distinct other watched wallets in the prior 60 minutes; repeat activity from the same wallet does not inflate confirmation.
+- Paper position size remains $25, with max 5 open positions, +20% take profit, and -10% stop loss.
+- Still paper trading only; no live trades are sent.
 
 Required private Render variables:
 - `BIRDEYE_API_KEY`
