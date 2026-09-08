@@ -1,4 +1,4 @@
-# Solana Smart-Money Scanner V2.4
+# Solana Smart-Money Scanner V2.5
 
 V2 is still paper-trading only.
 
@@ -24,7 +24,7 @@ When ready, Helius Enhanced Mainnet webhook endpoint:
 Use SWAP first and monitor only the vetted wallet addresses.
 
 
-## V2.4 fixes
+## V2.5 fixes
 - Removed wallets now disappear from the watchlist immediately (they remain inactive in the database for history).
 - Failed Birdeye analysis no longer leaves a new ghost wallet with blank stats.
 - Analyze/Add shows an obvious busy state and success/error feedback.
@@ -33,23 +33,31 @@ Use SWAP first and monitor only the vetted wallet addresses.
 - Birdeye HTTP errors are surfaced on screen instead of silently appearing as blank stats.
 
 
-## V2.4
+## V2.5
 - Fixes feedback messages on mobile Chrome by avoiding the browser's built-in `window.status`.
 - Birdeye Test now shows a visible result.
 - Adds a 15-second browser timeout for the API test.
 - Wallet analysis has a 30-second browser timeout.
 
 
-## V2.4
+## V2.5
 - Adds a server-side Birdeye request queue for the free/Standard rate limit.
 - Keeps Birdeye requests at least 1.15 seconds apart.
 - Automatically retries HTTP 429 responses with backoff.
 - No paid Birdeye upgrade is required for this fix.
 
 
-## V2.4
+## V2.5
 - Wallet score now weighs realized P&L, average profit per trade, trade sample size, and consistency.
 - Raw win rate is intentionally a smaller part of the score.
 - Pulls both Net Cash and WAC wallet P&L for comparison.
 - Adds 30d/90d P&L, average profit/trade, and WAC 90d P&L to the watchlist table.
 - Existing Neon database is migrated automatically.
+
+
+## V2.5
+- Fixes mobile tab navigation for Wallets / Signals / Paper Trades.
+- Selected tab now visibly highlights.
+- Tapping a metric card opens the matching panel.
+- The selected section scrolls into view on mobile.
+- Adds a clear empty-state message when no signals exist.
