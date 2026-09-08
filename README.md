@@ -1,4 +1,4 @@
-# Solana Smart-Money Scanner V2
+# Solana Smart-Money Scanner V2.1
 
 V2 is still paper-trading only.
 
@@ -22,3 +22,12 @@ When ready, Helius Enhanced Mainnet webhook endpoint:
 `https://solana-smart-money-scanner.onrender.com/webhooks/helius`
 
 Use SWAP first and monitor only the vetted wallet addresses.
+
+
+## V2.1 fixes
+- Removed wallets now disappear from the watchlist immediately (they remain inactive in the database for history).
+- Failed Birdeye analysis no longer leaves a new ghost wallet with blank stats.
+- Analyze/Add shows an obvious busy state and success/error feedback.
+- Existing unscored wallets have an Analyze button so they can be retried without removing them.
+- Added a Test Birdeye button that checks the configured API key/connection.
+- Birdeye HTTP errors are surfaced on screen instead of silently appearing as blank stats.
