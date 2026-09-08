@@ -1,4 +1,4 @@
-import os, json, math
+import os, json, math, time, threading
 from typing import Any
 import requests
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
@@ -23,7 +23,7 @@ elif DATABASE_URL.startswith('postgresql://') and '+psycopg' not in DATABASE_URL
     DATABASE_URL='postgresql+psycopg://'+DATABASE_URL[len('postgresql://'):]
 
 engine=create_engine(DATABASE_URL,pool_pre_ping=True,future=True)
-app=FastAPI(title='Solana Smart-Money Scanner V2.2')
+app=FastAPI(title='Solana Smart-Money Scanner V2.3')
 
 def sqlite(): return DATABASE_URL.startswith('sqlite')
 
@@ -50,17 +50,54 @@ def startup():
     with engine.begin() as c:
         for s in SCHEMA: c.execute(text(s.format(ID=ident)))
 
+# Birdeye Standard/free tier is rate-limited. Serialize all Birdeye calls
+# and keep them a little over one second apart so normal wallet analysis
+# does not trigger HTTP 429.
+_bird_lock=threading.Lock()
+_bird_last_request=0.0
+BIRDEYE_MIN_INTERVAL=float(os.getenv('BIRDEYE_MIN_INTERVAL','1.15'))
+
 def bheaders():
     if not BIRDEYE_API_KEY: raise RuntimeError('BIRDEYE_API_KEY is not configured')
     return {'X-API-KEY':BIRDEYE_API_KEY,'x-chain':'solana','accept':'application/json'}
 
 def bird_get(url,params,timeout=10):
-    try:
-        r=requests.get(url,params=params,headers=bheaders(),timeout=timeout)
-    except requests.Timeout:
-        raise RuntimeError('Birdeye timed out. Please try again.')
-    except requests.RequestException as e:
-        raise RuntimeError(f'Could not reach Birdeye: {e}')
+    global _bird_last_request
+    last_response=None
+
+    # Retry 429s automatically. This lets the free 1-rps tier work
+    # without requiring the user to manually wait between requests.
+    for attempt in range(4):
+        with _bird_lock:
+            elapsed=time.monotonic()-_bird_last_request
+            wait=max(0.0,BIRDEYE_MIN_INTERVAL-elapsed)
+            if wait:
+                time.sleep(wait)
+
+            try:
+                r=requests.get(url,params=params,headers=bheaders(),timeout=timeout)
+            except requests.Timeout:
+                raise RuntimeError('Birdeye timed out. Please try again.')
+            except requests.RequestException as e:
+                raise RuntimeError(f'Could not reach Birdeye: {e}')
+            finally:
+                _bird_last_request=time.monotonic()
+
+        last_response=r
+        if r.status_code != 429:
+            break
+
+        # Respect Retry-After when Birdeye supplies it; otherwise back off.
+        try:
+            retry_after=float(r.headers.get('Retry-After') or 0)
+        except Exception:
+            retry_after=0
+        time.sleep(max(retry_after,1.5*(attempt+1)))
+
+    r=last_response
+    if r is None:
+        raise RuntimeError('Birdeye request failed before receiving a response.')
+
     if not r.ok:
         try:
             body=r.json()
@@ -68,11 +105,15 @@ def bird_get(url,params,timeout=10):
         except Exception:
             detail=r.text
         detail=str(detail).replace('\n',' ')[:220]
+        if r.status_code == 429:
+            detail='Rate limit reached after automatic retries. Wait about a minute and try again.'
         raise RuntimeError(f'Birdeye HTTP {r.status_code}: {detail}')
+
     try:
         payload=r.json() or {}
     except Exception:
         raise RuntimeError('Birdeye returned an unreadable response.')
+
     if payload.get('success') is False:
         raise RuntimeError('Birdeye: '+str(payload.get('message') or payload.get('error') or 'request failed'))
     return payload
@@ -193,7 +234,7 @@ class WalletIn(BaseModel):
     label:str=Field(default='Watched wallet',max_length=80)
 
 @app.get('/health')
-def health(): return {'ok':True,'version':'2.2','database':'sqlite' if sqlite() else 'postgres'}
+def health(): return {'ok':True,'version':'2.3','database':'sqlite' if sqlite() else 'postgres'}
 
 @app.get('/api/wallets')
 def wallets(): return q('SELECT * FROM wallets WHERE active=1 ORDER BY created_at DESC')
@@ -256,8 +297,8 @@ def dash():
 
 HTML='''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Scanner V2</title><style>
 :root{color-scheme:dark}body{margin:0;background:#0b0d10;color:#f4f4f5;font-family:system-ui}.w{max-width:1050px;margin:auto;padding:18px}.muted{color:#9ca3af}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:18px 0}.card{background:#14171c;border:1px solid #292e36;border-radius:14px;padding:14px}.m{font-size:28px;font-weight:800}.tabs{display:flex;gap:7px;margin:15px 0}button{border:0;border-radius:9px;padding:9px 11px;font-weight:700}button:disabled{opacity:.55}.status{min-height:24px;margin-top:10px;font-size:13px}.smallbtn{padding:6px 8px;font-size:11px;margin:2px}.panel{display:none}.panel.on{display:block}input{width:100%;box-sizing:border-box;padding:11px;margin:5px 0;border-radius:9px;border:1px solid #343a45;background:#0d1014;color:white}table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;padding:9px 6px;border-bottom:1px solid #292e36}.pill{padding:3px 7px;border-radius:999px;font-weight:800;font-size:11px}.HIGH{background:#123a25;color:#8ef0b1}.MEDIUM{background:#3c3214;color:#f5d977}.LOW{background:#3b1b1b;color:#ffabab}.ok{color:#8ef0b1}.warn{color:#f5d977}.bad{color:#ffabab}@media(max-width:720px){.grid{grid-template-columns:repeat(2,1fr)}.hide{display:none}}
-</style></head><body><div class="w"><h1>Solana Smart-Money Scanner V2.2</h1><div class="muted">Real wallet scoring + Helius feed + $500 paper account. No live trading.</div><div id="db" style="margin-top:8px"></div><div class="grid"><div class="card">Wallets<div class="m" id="wc">—</div></div><div class="card">Signals<div class="m" id="sc">—</div></div><div class="card">Closed trades<div class="m" id="cc">—</div></div><div class="card">Paper equity<div class="m" id="eq">—</div></div></div><div class="tabs"><button onclick="tab('wa')">Wallets</button><button onclick="tab('si')">Signals</button><button onclick="tab('pa')">Paper Trades</button></div>
-<div id="wa" class="panel on"><div class="card"><h2>Add real wallet</h2><div class="muted" style="font-size:13px;margin-bottom:8px">The button will stay disabled while Birdeye checks 30d + 90d performance.</div><input id="addr" placeholder="Public Solana wallet address"><input id="label" placeholder="Label (optional)"><button id="addBtn" onclick="add()">Analyze + Add</button> <button id="birdBtn" onclick="testBird()">Test Birdeye</button><div id="feedback" class="status"></div></div><h2>Watchlist</h2><div class="card" style="overflow:auto"><table><thead><tr><th>Wallet</th><th>Score</th><th>30d</th><th>90d</th><th class="hide">90d P&L</th><th></th></tr></thead><tbody id="wr"></tbody></table></div></div>
+</style></head><body><div class="w"><h1>Solana Smart-Money Scanner V2.3</h1><div class="muted">Real wallet scoring + Helius feed + $500 paper account. No live trading.</div><div id="db" style="margin-top:8px"></div><div class="grid"><div class="card">Wallets<div class="m" id="wc">—</div></div><div class="card">Signals<div class="m" id="sc">—</div></div><div class="card">Closed trades<div class="m" id="cc">—</div></div><div class="card">Paper equity<div class="m" id="eq">—</div></div></div><div class="tabs"><button onclick="tab('wa')">Wallets</button><button onclick="tab('si')">Signals</button><button onclick="tab('pa')">Paper Trades</button></div>
+<div id="wa" class="panel on"><div class="card"><h2>Add real wallet</h2><div class="muted" style="font-size:13px;margin-bottom:8px">Birdeye free tier is rate-limited, so 30d + 90d analysis may take a few seconds.</div><input id="addr" placeholder="Public Solana wallet address"><input id="label" placeholder="Label (optional)"><button id="addBtn" onclick="add()">Analyze + Add</button> <button id="birdBtn" onclick="testBird()">Test Birdeye</button><div id="feedback" class="status"></div></div><h2>Watchlist</h2><div class="card" style="overflow:auto"><table><thead><tr><th>Wallet</th><th>Score</th><th>30d</th><th>90d</th><th class="hide">90d P&L</th><th></th></tr></thead><tbody id="wr"></tbody></table></div></div>
 <div id="si" class="panel"><h2>Signals</h2><div class="card" style="overflow:auto"><table><thead><tr><th>Level</th><th>Score</th><th>Token</th><th>Why</th></tr></thead><tbody id="sr"></tbody></table></div></div>
 <div id="pa" class="panel"><h2>Paper Trades</h2><div class="muted">$25 max · +20% take profit · -10% stop · max 5 open</div><button onclick="refreshP()" style="margin:10px 0">Refresh prices</button><div class="card" style="overflow:auto"><table><thead><tr><th>Status</th><th>Token</th><th>Entry</th><th>Current/Exit</th><th>P&L</th></tr></thead><tbody id="pr"></tbody></table></div></div></div><script>
 function tab(x){document.querySelectorAll('.panel').forEach(e=>e.classList.remove('on'));document.getElementById(x).classList.add('on')}function sh(s){return !s?'—':s.length>14?s.slice(0,6)+'…'+s.slice(-5):s}function money(v,d=2){return v==null?'—':'$'+Number(v).toLocaleString(undefined,{maximumFractionDigits:d,minimumFractionDigits:d})}function pct(v){return v==null?'—':(100*Number(v)).toFixed(0)+'%'}

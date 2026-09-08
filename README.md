@@ -1,4 +1,4 @@
-# Solana Smart-Money Scanner V2.2
+# Solana Smart-Money Scanner V2.3
 
 V2 is still paper-trading only.
 
@@ -24,7 +24,7 @@ When ready, Helius Enhanced Mainnet webhook endpoint:
 Use SWAP first and monitor only the vetted wallet addresses.
 
 
-## V2.2 fixes
+## V2.3 fixes
 - Removed wallets now disappear from the watchlist immediately (they remain inactive in the database for history).
 - Failed Birdeye analysis no longer leaves a new ghost wallet with blank stats.
 - Analyze/Add shows an obvious busy state and success/error feedback.
@@ -33,8 +33,15 @@ Use SWAP first and monitor only the vetted wallet addresses.
 - Birdeye HTTP errors are surfaced on screen instead of silently appearing as blank stats.
 
 
-## V2.2
+## V2.3
 - Fixes feedback messages on mobile Chrome by avoiding the browser's built-in `window.status`.
 - Birdeye Test now shows a visible result.
 - Adds a 15-second browser timeout for the API test.
 - Wallet analysis has a 30-second browser timeout.
+
+
+## V2.3
+- Adds a server-side Birdeye request queue for the free/Standard rate limit.
+- Keeps Birdeye requests at least 1.15 seconds apart.
+- Automatically retries HTTP 429 responses with backoff.
+- No paid Birdeye upgrade is required for this fix.
