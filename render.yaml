@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: solana-smart-money-scanner
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.7
+      - key: PAPER_STARTING_CASH
+        value: "500"
+      - key: MIN_LIQUIDITY_USD
+        value: "100000"
