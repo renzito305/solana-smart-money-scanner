@@ -1,5 +1,8 @@
 import os, json, math, time, threading
 from typing import Any
+from datetime import datetime, timezone
+from sqlalchemy import inspect
+import logging
 import requests
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse
@@ -23,7 +26,23 @@ elif DATABASE_URL.startswith('postgresql://') and '+psycopg' not in DATABASE_URL
     DATABASE_URL='postgresql+psycopg://'+DATABASE_URL[len('postgresql://'):]
 
 engine=create_engine(DATABASE_URL,pool_pre_ping=True,future=True)
-app=FastAPI(title='Solana Smart-Money Scanner V2.6')
+app=FastAPI(title='Solana Smart-Money Scanner V2.7')
+logger=logging.getLogger('scanner')
+PAPER_REFRESH_SECONDS=max(30,int(os.getenv('PAPER_REFRESH_SECONDS','60')))
+PRICE_STALE_SECONDS=max(60,int(os.getenv('PRICE_STALE_SECONDS','180')))
+_refresh_lock=threading.Lock()
+_position_lock=threading.Lock()
+_stop=threading.Event()
+_refresh_state={'running':False,'started_at':None,'finished_at':None,'updated':0,'closed':0,'failed':0,'errors':[]}
+
+def utcnow(): return datetime.now(timezone.utc).isoformat()
+
+def safe_error(e):
+    value=str(e)
+    for secret in (BIRDEYE_API_KEY,HELIUS_WEBHOOK_SECRET,DATABASE_URL):
+        if secret: value=value.replace(secret,'[redacted]')
+    return value[:240]
+
 
 def sqlite(): return DATABASE_URL.startswith('sqlite')
 
@@ -66,6 +85,34 @@ def startup():
         except Exception:
             pass
 
+    # Additive migration: keep existing wallets, signals and positions.
+    migrations={
+        'paper_positions': {'price_checked_at':'TEXT','price_updated_at':'TEXT',
+                            'price_error':'TEXT','provider_updated_at':'REAL'},
+        'signals': {'market_error':'TEXT'},
+    }
+    for table,columns in migrations.items():
+        existing={col['name'] for col in inspect(engine).get_columns(table)}
+        for col,kind in columns.items():
+            if col not in existing:
+                run(f'ALTER TABLE {table} ADD COLUMN {col} {kind}')
+    _stop.clear()
+    app.state.price_thread=threading.Thread(target=price_loop,daemon=True)
+    app.state.price_thread.start()
+
+@app.on_event('shutdown')
+def shutdown():
+    _stop.set()
+    thread=getattr(app.state,'price_thread',None)
+    if thread: thread.join(timeout=2)
+
+
+def price_loop():
+    # Independent of browsers and incoming wallet activity; only while host runs.
+    while not _stop.is_set():
+        refresh_paper()
+        _stop.wait(PAPER_REFRESH_SECONDS)
+
 # Birdeye Standard/free tier is rate-limited. Serialize all Birdeye calls
 # and keep them a little over one second apart so normal wallet analysis
 # does not trigger HTTP 429.
@@ -95,7 +142,7 @@ def bird_get(url,params,timeout=10):
             except requests.Timeout:
                 raise RuntimeError('Birdeye timed out. Please try again.')
             except requests.RequestException as e:
-                raise RuntimeError(f'Could not reach Birdeye: {e}')
+                raise RuntimeError('Could not reach Birdeye (network or connection error).')
             finally:
                 _bird_last_request=time.monotonic()
 
@@ -108,7 +155,7 @@ def bird_get(url,params,timeout=10):
             retry_after=float(r.headers.get('Retry-After') or 0)
         except Exception:
             retry_after=0
-        time.sleep(max(retry_after,1.5*(attempt+1)))
+        time.sleep(min(15,max(retry_after,1.5*(attempt+1))))
 
     r=last_response
     if r is None:
@@ -177,9 +224,29 @@ def wallet_pnl(addr,duration,method='net_cash'):
 
 def market(mint):
     payload=bird_get('https://public-api.birdeye.so/defi/price',{'address':mint,'include_liquidity':'true'},timeout=8)
-    d=payload.get('data') or {}; liq=d.get('liquidity')
-    if isinstance(liq,dict): liq=liq.get('usd') or liq.get('value')
-    return {'price':float(d['value']) if d.get('value') is not None else None,'liquidity':float(liq) if liq is not None else None}
+    d=payload.get('data') or {}
+    if not isinstance(d,dict): raise RuntimeError('Birdeye returned no market data.')
+    try:
+        price=float(d['value'])
+        if not math.isfinite(price) or price<=0: raise ValueError()
+    except (KeyError,TypeError,ValueError):
+        raise RuntimeError('Birdeye returned no valid positive price for this token.')
+    liq=d.get('liquidity')
+    if isinstance(liq,dict): liq=liq.get('usd',liq.get('value'))
+    try:
+        liq=float(liq) if liq is not None else None
+        if liq is not None and (not math.isfinite(liq) or liq<0): liq=None
+    except (TypeError,ValueError): liq=None
+    stamp=d.get('updateUnixTime')
+    if stamp is not None:
+        try:
+            stamp=float(stamp)
+            if not math.isfinite(stamp) or stamp<=0 or stamp>time.time()+60: raise ValueError()
+        except (TypeError,ValueError):
+            raise RuntimeError('Birdeye returned an invalid quote timestamp.')
+        if time.time()-stamp>PRICE_STALE_SECONDS:
+            raise RuntimeError('Birdeye quote is stale; entry/exit skipped until a fresh quote arrives.')
+    return {'price':price,'liquidity':liq,'provider_updated_at':stamp}
 
 def calc_wallet_score(a,b):
     # V2.5: less emphasis on raw win rate; more on realized profitability and expectancy.
@@ -268,9 +335,13 @@ def signal_score(ws,liq,conf):
     return s,'HIGH' if s>=80 else 'MEDIUM' if s>=65 else 'LOW'
 
 def open_paper(signal_id,mint,price,score,liquidity):
-    # V2.6: MEDIUM/HIGH signals are eligible at 65+, but paper trades
+    with _position_lock:
+        return _open_paper(signal_id,mint,price,score,liquidity)
+
+def _open_paper(signal_id,mint,price,score,liquidity):
+    # V2.7: MEDIUM/HIGH signals are eligible at 65+, but paper trades
     # still require the configured minimum liquidity.
-    if score<SIGNAL_SCORE_THRESHOLD or not price: return
+    if score<SIGNAL_SCORE_THRESHOLD or not price or not math.isfinite(price) or price<=0: return
     if float(liquidity or 0)<MIN_LIQUIDITY_USD: return
     if one("SELECT COUNT(*) n FROM paper_positions WHERE status='OPEN'")['n']>=PAPER_MAX_OPEN: return
     if one("SELECT COUNT(*) n FROM paper_positions WHERE status='OPEN' AND token_mint=:m",{'m':mint})['n']: return
@@ -280,22 +351,48 @@ def open_paper(signal_id,mint,price,score,liquidity):
     if amount<1:return
     run('''INSERT INTO paper_positions(token_mint,signal_id,usd_amount,entry_price,current_price,quantity,status) VALUES(:m,:sid,:u,:p,:p,:q,'OPEN')''',{'m':mint,'sid':signal_id,'u':amount,'p':price,'q':amount/price})
 
-def refresh_paper():
-    n=closed=0
-    for p in q("SELECT * FROM paper_positions WHERE status='OPEN'"):
-        try:
-            price=market(p['token_mint']).get('price')
-            if not price: continue
-            pct=(price/float(p['entry_price'])-1)*100; reason=None
-            if pct>=PAPER_TAKE_PROFIT_PCT: reason='TAKE_PROFIT'
-            elif pct<=-PAPER_STOP_LOSS_PCT: reason='STOP_LOSS'
-            if reason:
-                pnl=float(p['quantity'])*price-float(p['usd_amount'])
-                run("UPDATE paper_positions SET current_price=:p,status='CLOSED',exit_price=:p,realized_pnl=:x,exit_reason=:r,closed_at=CURRENT_TIMESTAMP WHERE id=:id",{'p':price,'x':pnl,'r':reason,'id':p['id']}); closed+=1
-            else: run('UPDATE paper_positions SET current_price=:p WHERE id=:id',{'p':price,'id':p['id']})
-            n+=1
-        except Exception: pass
-    return {'updated':n,'closed':closed}
+def refresh_paper(reserved=False):
+    if not reserved and not _refresh_lock.acquire(blocking=False):
+        return dict(_refresh_state)
+    _refresh_state.update(running=True,started_at=utcnow(),finished_at=None,updated=0,closed=0,failed=0,errors=[])
+    errors=[]; n=closed=failed=0
+    try:
+        for p in q("SELECT * FROM paper_positions WHERE status='OPEN'"):
+            checked=utcnow()
+            try:
+                md=market(p['token_mint']); price=md['price']
+                pct=(price/float(p['entry_price'])-1)*100; reason=None
+                if price>=float(p['entry_price'])*(1+PAPER_TAKE_PROFIT_PCT/100): reason='TAKE_PROFIT'
+                elif price<=float(p['entry_price'])*(1-PAPER_STOP_LOSS_PCT/100): reason='STOP_LOSS'
+                values={'p':price,'id':p['id'],'t':utcnow(),'provider':md.get('provider_updated_at')}
+                with _position_lock:
+                    if reason:
+                        values.update(x=float(p['quantity'])*price-float(p['usd_amount']),r=reason)
+                        run("UPDATE paper_positions SET current_price=:p,status='CLOSED',exit_price=:p,realized_pnl=:x,exit_reason=:r,closed_at=CURRENT_TIMESTAMP,price_checked_at=:t,price_updated_at=:t,price_error=NULL,provider_updated_at=:provider WHERE id=:id AND status='OPEN'",values)
+                        closed+=1
+                    else:
+                        run("UPDATE paper_positions SET current_price=:p,price_checked_at=:t,price_updated_at=:t,price_error=NULL,provider_updated_at=:provider WHERE id=:id AND status='OPEN'",values)
+                n+=1
+            except Exception as e:
+                error=safe_error(e); failed+=1
+                errors.append({'token':p['token_mint'],'message':error})
+                run('UPDATE paper_positions SET price_checked_at=:t,price_error=:e WHERE id=:id',{'t':checked,'e':error,'id':p['id']})
+                logger.warning('Price refresh failed for %s: %s',p['token_mint'],error)
+            _refresh_state.update(updated=n,closed=closed,failed=failed,errors=list(errors))
+    except Exception as e:
+        failed+=1; errors.append({'token':'refresh','message':safe_error(e)})
+        logger.error('Refresh cycle failed: %s',safe_error(e))
+    finally:
+        _refresh_state.update(running=False,finished_at=utcnow(),updated=n,closed=closed,failed=failed,errors=errors)
+        _refresh_lock.release()
+    return dict(_refresh_state)
+
+
+def position_fresh(p):
+    stamp=p.get('price_updated_at')
+    if not stamp or p.get('price_error'): return False
+    try: return (datetime.now(timezone.utc)-datetime.fromisoformat(str(stamp))).total_seconds()<=PRICE_STALE_SECONDS
+    except (ValueError,TypeError): return False
 
 def process_events(events):
     try:
@@ -307,9 +404,12 @@ def process_events(events):
                 mint=bought_mint(ev,w['address'])
                 if not mint: continue
                 if one('SELECT COUNT(*) n FROM signals WHERE signature=:s AND wallet_address=:w AND token_mint=:m',{'s':sig,'w':w['address'],'m':mint})['n']: continue
-                try: md=market(mint)
-                except Exception: md={'price':None,'liquidity':None}
-                # V2.6: confirmation means distinct OTHER watched wallets that
+                try:
+                    md=market(mint)
+                    md['error']=None if md['liquidity'] is not None else 'Liquidity unavailable; entry blocked.'
+                except Exception as e:
+                    md={'price':None,'liquidity':None,'error':safe_error(e)}
+                # V2.7: confirmation means distinct OTHER watched wallets that
                 # signaled the same token within 60 minutes, plus this wallet.
                 # Repeated buys from the same wallet no longer inflate confirmation.
                 if sqlite():
@@ -317,11 +417,12 @@ def process_events(events):
                 else:
                     recent=one("SELECT COUNT(DISTINCT wallet_address) n FROM signals WHERE token_mint=:m AND wallet_address<>:w AND created_at>=CURRENT_TIMESTAMP-INTERVAL '60 minutes'",{'m':mint,'w':w['address']})['n']
                 conf=max(1,int(recent or 0)+1); score,level=signal_score(w['wallet_score'],md.get('liquidity'),conf)
-                reason=f"wallet {w['wallet_score']}/60; 30d win {float(w['win_rate_30d'] or 0):.0%}; 90d win {float(w['win_rate_90d'] or 0):.0%}; liquidity ${float(md.get('liquidity') or 0):,.0f}; confirmation {conf}"
+                liquidity_label='unavailable' if md.get('liquidity') is None else f"${md['liquidity']:,.0f}"
+                reason=f"wallet {w['wallet_score']}/60; 30d win {float(w['win_rate_30d'] or 0):.0%}; 90d win {float(w['win_rate_90d'] or 0):.0%}; liquidity {liquidity_label}; confirmation {conf}"
                 run('''INSERT INTO signals(token_mint,wallet_address,price_usd,liquidity_usd,wallet_score,confirmation_count,score,level,reason,signature,source) VALUES(:m,:w,:p,:l,:ws,:c,:s,:lv,:r,:sig,'REAL')''',{'m':mint,'w':w['address'],'p':md.get('price'),'l':md.get('liquidity'),'ws':w['wallet_score'],'c':conf,'s':score,'lv':level,'r':reason,'sig':sig})
                 sid=one('SELECT id FROM signals WHERE wallet_address=:w AND token_mint=:m ORDER BY id DESC LIMIT 1',{'w':w['address'],'m':mint})['id']
+                run('UPDATE signals SET market_error=:e WHERE id=:id',{'e':md.get('error'),'id':sid})
                 open_paper(sid,mint,md.get('price'),score,md.get('liquidity'))
-        refresh_paper()
     except Exception as e: print('webhook worker error',repr(e))
 
 class WalletIn(BaseModel):
@@ -329,7 +430,7 @@ class WalletIn(BaseModel):
     label:str=Field(default='Watched wallet',max_length=80)
 
 @app.get('/health')
-def health(): return {'ok':True,'version':'2.6','database':'sqlite' if sqlite() else 'postgres'}
+def health(): return {'ok':True,'version':'2.7','database':'sqlite' if sqlite() else 'postgres'}
 
 @app.get('/api/wallets')
 def wallets(): return q('SELECT * FROM wallets WHERE active=1 ORDER BY created_at DESC')
@@ -421,25 +522,32 @@ async def helius(req:Request,bg:BackgroundTasks):
     return {'ok':True,'received':len(events)}
 
 @app.post('/api/paper/refresh')
-def rp(): return {'ok':True,**refresh_paper()}
+def rp(bg:BackgroundTasks):
+    if not _refresh_lock.acquire(blocking=False):
+        return {'accepted':False,**_refresh_state}
+    _refresh_state.update(running=True,started_at=utcnow(),finished_at=None,updated=0,closed=0,failed=0,errors=[])
+    bg.add_task(refresh_paper,True)
+    return {'accepted':True,**_refresh_state}
 
 @app.get('/api/paper')
 def psum():
     p=q('SELECT * FROM paper_positions ORDER BY id DESC'); closed=[x for x in p if x['status']=='CLOSED']
     realized=sum(float(x.get('realized_pnl') or 0) for x in closed); unreal=sum(float(x['quantity'])*float(x['current_price'])-float(x['usd_amount']) for x in p if x['status']=='OPEN')
     wins=sum(1 for x in closed if float(x.get('realized_pnl') or 0)>0)
-    return {'equity':round(PAPER_STARTING_CASH+realized+unreal,2),'closed':len(closed),'win_rate':wins/len(closed) if closed else None,'positions':p}
+    stale=sum(1 for x in p if x['status']=='OPEN' and not position_fresh(x))
+    for x in p: x['price_stale']=x['status']=='OPEN' and not position_fresh(x)
+    return {'stale_positions':stale,'refresh':dict(_refresh_state),'refresh_seconds':PAPER_REFRESH_SECONDS,'equity':round(PAPER_STARTING_CASH+realized+unreal,2),'closed':len(closed),'win_rate':wins/len(closed) if closed else None,'positions':p}
 
 @app.get('/api/dashboard')
 def dash():
     return {'wallets':one('SELECT COUNT(*) n FROM wallets WHERE active=1')['n'],'signals':one("SELECT COUNT(*) n FROM signals WHERE source='REAL'")['n'],'latest':q('SELECT * FROM signals ORDER BY id DESC LIMIT 30'),'database':'SQLite (temporary)' if sqlite() else 'Postgres (persistent)'}
 
-HTML='''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Scanner V2.6</title><style>
+HTML='''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Scanner V2.7</title><style>
 :root{color-scheme:dark}body{margin:0;background:#0b0d10;color:#f4f4f5;font-family:system-ui}.w{max-width:1050px;margin:auto;padding:18px}.muted{color:#9ca3af}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:18px 0}.card{background:#14171c;border:1px solid #292e36;border-radius:14px;padding:14px}.m{font-size:28px;font-weight:800}.tabs{display:flex;gap:7px;margin:15px 0}.tabs button.active{outline:2px solid #f4f4f5}.clickcard{cursor:pointer}.clickcard:active{transform:scale(.99)}button{border:0;border-radius:9px;padding:9px 11px;font-weight:700}button:disabled{opacity:.55}.status{min-height:24px;margin-top:10px;font-size:13px}.smallbtn{padding:6px 8px;font-size:11px;margin:2px}.panel{display:none}.panel.on{display:block}input{width:100%;box-sizing:border-box;padding:11px;margin:5px 0;border-radius:9px;border:1px solid #343a45;background:#0d1014;color:white}table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;padding:9px 6px;border-bottom:1px solid #292e36}.pill{padding:3px 7px;border-radius:999px;font-weight:800;font-size:11px}.HIGH{background:#123a25;color:#8ef0b1}.MEDIUM{background:#3c3214;color:#f5d977}.LOW{background:#3b1b1b;color:#ffabab}.ok{color:#8ef0b1}.warn{color:#f5d977}.bad{color:#ffabab}@media(max-width:720px){.grid{grid-template-columns:repeat(2,1fr)}.hide{display:none}}
-</style></head><body><div class="w"><h1>Solana Smart-Money Scanner V2.6</h1><div class="muted">Real wallet scoring + Helius feed + $500 paper account. No live trading.</div><div id="db" style="margin-top:8px"></div><div class="grid"><div class="card clickcard" onclick="showPanel('wa')">Wallets<div class="m" id="wc">—</div></div><div class="card clickcard" onclick="showPanel('si')">Signals<div class="m" id="sc">—</div></div><div class="card clickcard" onclick="showPanel('pa')">Closed trades<div class="m" id="cc">—</div></div><div class="card clickcard" onclick="showPanel('pa')">Paper equity<div class="m" id="eq">—</div></div></div><div class="tabs"><button id="tab-wa" class="active" onclick="showPanel('wa')">Wallets</button><button id="tab-si" onclick="showPanel('si')">Signals</button><button id="tab-pa" onclick="showPanel('pa')">Paper Trades</button></div>
-<div id="wa" class="panel on"><div class="card"><h2>Add real wallet</h2><div class="muted" style="font-size:13px;margin-bottom:8px">V2.6 checks profitability + expectancy, not just win rate. Analysis may take ~5–10 seconds.</div><input id="addr" placeholder="Public Solana wallet address"><input id="label" placeholder="Label (optional)"><button id="addBtn" onclick="add()">Analyze + Add</button> <button id="birdBtn" onclick="testBird()">Test Birdeye</button><div id="feedback" class="status"></div></div><h2>Watchlist</h2><div class="card" style="overflow:auto"><table><thead><tr><th>Wallet</th><th>Score</th><th>30d</th><th>90d</th><th class="hide">30d P&L</th><th class="hide">90d P&L</th><th class="hide">Avg/trade</th><th class="hide">WAC 90d</th><th></th></tr></thead><tbody id="wr"></tbody></table></div></div>
+</style></head><body><div class="w"><h1>Solana Smart-Money Scanner V2.7</h1><div class="muted">Real wallet scoring + Helius feed + $500 paper account. No live trading.</div><div id="db" style="margin-top:8px"></div><div class="grid"><div class="card clickcard" onclick="showPanel('wa')">Wallets<div class="m" id="wc">—</div></div><div class="card clickcard" onclick="showPanel('si')">Signals<div class="m" id="sc">—</div></div><div class="card clickcard" onclick="showPanel('pa')">Closed trades<div class="m" id="cc">—</div></div><div class="card clickcard" onclick="showPanel('pa')">Paper equity<div class="m" id="eq">—</div></div></div><div class="tabs"><button id="tab-wa" class="active" onclick="showPanel('wa')">Wallets</button><button id="tab-si" onclick="showPanel('si')">Signals</button><button id="tab-pa" onclick="showPanel('pa')">Paper Trades</button></div>
+<div id="wa" class="panel on"><div class="card"><h2>Add real wallet</h2><div class="muted" style="font-size:13px;margin-bottom:8px">V2.7 checks profitability + expectancy, not just win rate. Analysis may take ~5–10 seconds.</div><input id="addr" placeholder="Public Solana wallet address"><input id="label" placeholder="Label (optional)"><button id="addBtn" onclick="add()">Analyze + Add</button> <button id="birdBtn" onclick="testBird()">Test Birdeye</button><div id="feedback" class="status"></div></div><h2>Watchlist</h2><div class="card" style="overflow:auto"><table><thead><tr><th>Wallet</th><th>Score</th><th>30d</th><th>90d</th><th class="hide">30d P&L</th><th class="hide">90d P&L</th><th class="hide">Avg/trade</th><th class="hide">WAC 90d</th><th></th></tr></thead><tbody id="wr"></tbody></table></div></div>
 <div id="si" class="panel"><h2>Signals</h2><div class="card" style="overflow:auto"><table><thead><tr><th>Level</th><th>Score</th><th>Token</th><th>Why</th></tr></thead><tbody id="sr"></tbody></table></div></div>
-<div id="pa" class="panel"><h2>Paper Trades</h2><div class="muted">$25 max · 65+ score · $100K min liquidity · +20% take profit · -10% stop · max 5 open</div><button onclick="refreshP()" style="margin:10px 0">Refresh prices</button><div class="card" style="overflow:auto"><table><thead><tr><th>Status</th><th>Token</th><th>Entry</th><th>Current/Exit</th><th>P&L</th></tr></thead><tbody id="pr"></tbody></table></div></div></div><script>
+<div id="pa" class="panel"><h2>Paper Trades</h2><div class="muted">$25 max · 65+ score · $100K min liquidity · +20% take profit · -10% stop · max 5 open</div><button id="refreshBtn" onclick="refreshP()" style="margin:10px 0">Refresh prices</button><div id="priceFeedback" class="status" role="status" aria-live="polite"></div><div id="priceHealth" class="muted"></div><div class="card" style="overflow:auto"><table><thead><tr><th>Status</th><th>Token</th><th>Entry</th><th>Current/Exit</th><th>P&L</th><th>Price check</th></tr></thead><tbody id="pr"></tbody></table></div></div></div><script>
 function showPanel(id){
  const target=document.getElementById(id);
  if(!target){console.error('Panel not found:',id);return}
@@ -451,6 +559,7 @@ function showPanel(id){
  setTimeout(()=>target.scrollIntoView({behavior:'smooth',block:'start'}),50);
 }function sh(s){return !s?'—':s.length>14?s.slice(0,6)+'…'+s.slice(-5):s}function money(v,d=2){return v==null?'—':'$'+Number(v).toLocaleString(undefined,{maximumFractionDigits:d,minimumFractionDigits:d})}function pct(v){return v==null?'—':(100*Number(v)).toFixed(0)+'%'}
 const feedbackEl=document.getElementById('feedback');
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function msg(html){feedbackEl.innerHTML=html}
 async function timedFetch(url,options={},ms=15000){
  const controller=new AbortController();
@@ -474,7 +583,7 @@ async function add(){
   document.getElementById('addr').value='';
   document.getElementById('label').value='';
   await load();
- }catch(e){msg('<span class="bad">'+e.message+'</span>')}
+ }catch(e){msg('<span class="bad">'+esc(e.message)+'</span>')}
  finally{btn.disabled=false;btn.textContent='Analyze + Add'}
 }
 async function testBird(){
@@ -486,18 +595,31 @@ async function testBird(){
   let d=await r.json();
   if(!r.ok)throw new Error(d.detail||'Birdeye test failed');
   msg('<span class="ok">Birdeye connected ✓'+(d.sol_price?' SOL ≈ $'+Number(d.sol_price).toFixed(2):'')+'</span>');
- }catch(e){msg('<span class="bad">'+e.message+'</span>')}
+ }catch(e){msg('<span class="bad">'+esc(e.message)+'</span>')}
  finally{btn.disabled=false;btn.textContent='Test Birdeye'}
 }
 async function del(a,b){b.disabled=true;b.textContent='Removing…';try{await fetch('/api/wallets/'+encodeURIComponent(a),{method:'DELETE'});await load()}finally{b.disabled=false;b.textContent='Remove'}}
-async function analyzeExisting(a,b){b.disabled=true;b.textContent='Analyzing…';msg('<span class="warn">Re-analyzing '+sh(a)+'…</span>');try{let r=await timedFetch('/api/wallets/'+encodeURIComponent(a)+'/refresh',{method:'POST'},30000);let d=await r.json();if(!r.ok)throw new Error(d.detail||'Analysis failed');msg('<span class="ok">Wallet stats updated ✓</span>');await load()}catch(e){msg('<span class="bad">'+e.message+'</span>');await load()}finally{b.disabled=false;b.textContent='Analyze'}}
-async function refreshP(){await fetch('/api/paper/refresh',{method:'POST'});load()}
-async function load(){let [d,p,w]=await Promise.all([fetch('/api/dashboard').then(r=>r.json()),fetch('/api/paper').then(r=>r.json()),fetch('/api/wallets').then(r=>r.json())]);wc.textContent=d.wallets;sc.textContent=d.signals;cc.textContent=p.closed;eq.textContent=money(p.equity);db.innerHTML=d.database.includes('temporary')?'<span class="warn">⚠ Temporary database — connect Postgres before real test.</span>':'<span class="ok">● Persistent database connected</span>';wr.innerHTML='';w.forEach(x=>{let st=x.stats_status||'NOT SCORED';let cls=st==='OK'?'ok':st.startsWith('ERROR')?'bad':'warn';wr.innerHTML+=`<tr><td><b>${x.label}</b><div class="muted">${sh(x.address)}</div><div class="${cls}" style="font-size:11px;margin-top:3px">${st}</div></td><td>${x.wallet_score==null?'—':x.wallet_score+'/60'}</td><td>${pct(x.win_rate_30d)}</td><td>${pct(x.win_rate_90d)}</td><td class="hide">${money(x.realized_pnl_30d)}</td><td class="hide">${money(x.realized_pnl_90d)}</td><td class="hide">${money(x.avg_profit_90d)}</td><td class="hide">${money(x.realized_pnl_90d_wac)}</td><td><button class="smallbtn" onclick="analyzeExisting('${x.address}',this)">Analyze</button><button class="smallbtn" onclick="del('${x.address}',this)">Remove</button></td></tr>`});sr.innerHTML='';
+async function analyzeExisting(a,b){b.disabled=true;b.textContent='Analyzing…';msg('<span class="warn">Re-analyzing '+sh(a)+'…</span>');try{let r=await timedFetch('/api/wallets/'+encodeURIComponent(a)+'/refresh',{method:'POST'},30000);let d=await r.json();if(!r.ok)throw new Error(d.detail||'Analysis failed');msg('<span class="ok">Wallet stats updated ✓</span>');await load()}catch(e){msg('<span class="bad">'+esc(e.message)+'</span>');await load()}finally{b.disabled=false;b.textContent='Analyze'}}
+function renderRefresh(p){
+ const b=document.getElementById('refreshBtn'),f=document.getElementById('priceFeedback'),r=p.refresh;
+ b.disabled=r.running;b.textContent=r.running?'Refreshing…':'Refresh prices';
+ if(r.running){f.textContent='Refreshing… '+r.updated+' updated, '+r.failed+' failed. You can leave this page open.';f.className='status warn'}
+ else if(r.finished_at){f.textContent=(r.failed?'Refresh finished with errors: ':'Refresh complete: ')+r.updated+' updated, '+r.closed+' closed, '+r.failed+' failed · '+new Date(r.finished_at).toLocaleTimeString()+(r.errors.length?' · '+r.errors[0].message:'');f.className='status '+(r.failed?'bad':'ok')}
+ document.getElementById('priceHealth').textContent=(p.stale_positions?p.stale_positions+' open position(s) have stale or unverified prices. Equity is based on last known prices. ':'')+'Automatic checks every '+p.refresh_seconds+' seconds after each cycle while the server is awake.';
+}
+async function refreshP(){
+ const b=document.getElementById('refreshBtn'),f=document.getElementById('priceFeedback');
+ b.disabled=true;b.textContent='Refreshing…';f.textContent='Requesting fresh prices…';
+ try{const r=await timedFetch('/api/paper/refresh',{method:'POST'},15000);if(!r.ok)throw new Error('Refresh request failed (HTTP '+r.status+').');await r.json();await load()}
+ catch(e){f.textContent=e.message+' The server may still be checking; status will update automatically.';f.className='status bad';b.disabled=false;b.textContent='Refresh prices'}
+}
+async function getJSON(url){const r=await timedFetch(url,{},15000);if(!r.ok)throw new Error('Dashboard request failed (HTTP '+r.status+').');return r.json()}
+async function load(){let [d,p,w]=await Promise.all([getJSON('/api/dashboard'),getJSON('/api/paper'),getJSON('/api/wallets')]);wc.textContent=d.wallets;sc.textContent=d.signals;cc.textContent=p.closed;eq.textContent=money(p.equity)+(p.stale_positions?' *':'');renderRefresh(p);db.innerHTML=d.database.includes('temporary')?'<span class="warn">⚠ Temporary database — connect Postgres before real test.</span>':'<span class="ok">● Persistent database connected</span>';wr.innerHTML='';w.forEach(x=>{let st=x.stats_status||'NOT SCORED';let cls=st==='OK'?'ok':st.startsWith('ERROR')?'bad':'warn';wr.innerHTML+=`<tr><td><b>${esc(x.label)}</b><div class="muted">${sh(x.address)}</div><div class="${cls}" style="font-size:11px;margin-top:3px">${esc(st)}</div></td><td>${x.wallet_score==null?'—':x.wallet_score+'/60'}</td><td>${pct(x.win_rate_30d)}</td><td>${pct(x.win_rate_90d)}</td><td class="hide">${money(x.realized_pnl_30d)}</td><td class="hide">${money(x.realized_pnl_90d)}</td><td class="hide">${money(x.avg_profit_90d)}</td><td class="hide">${money(x.realized_pnl_90d_wac)}</td><td><button class="smallbtn" onclick="analyzeExisting('${x.address}',this)">Analyze</button><button class="smallbtn" onclick="del('${x.address}',this)">Remove</button></td></tr>`});sr.innerHTML='';
 if(!d.latest.length){
  sr.innerHTML='<tr><td colspan="4" class="muted">No signals captured yet.</td></tr>';
 }else{
- d.latest.forEach(x=>{sr.innerHTML+=`<tr><td><span class="pill ${x.level}">${x.level}</span></td><td>${x.score}</td><td>${sh(x.token_mint)}</td><td>${x.reason}</td></tr>`});
-}pr.innerHTML='';p.positions.forEach(x=>{let pnl=x.status==='CLOSED'?Number(x.realized_pnl||0):Number(x.quantity)*Number(x.current_price)-Number(x.usd_amount);pr.innerHTML+=`<tr><td>${x.status}</td><td>${sh(x.token_mint)}</td><td>${money(x.entry_price,6)}</td><td>${money(x.status==='CLOSED'?x.exit_price:x.current_price,6)}</td><td class="${pnl>=0?'ok':'bad'}">${money(pnl)}</td></tr>`})}load();setInterval(load,15000)
+ d.latest.forEach(x=>{sr.innerHTML+=`<tr><td><span class="pill ${x.level}">${x.level}</span></td><td>${x.score}</td><td>${sh(x.token_mint)}</td><td>${esc(x.reason)}${x.market_error?`<div class="bad">${esc(x.market_error)}</div>`:""}</td></tr>`});
+}pr.innerHTML='';p.positions.forEach(x=>{let pnl=x.status==='CLOSED'?Number(x.realized_pnl||0):Number(x.quantity)*Number(x.current_price)-Number(x.usd_amount);pr.innerHTML+=`<tr><td>${x.status}</td><td>${sh(x.token_mint)}</td><td>${money(x.entry_price,6)}</td><td>${money(x.status==='CLOSED'?x.exit_price:x.current_price,6)}</td><td class="${pnl>=0?'ok':'bad'}">${money(pnl)}</td><td><div class="${x.price_stale?'warn':'ok'}">${x.price_stale?'STALE / UNVERIFIED':x.status==='CLOSED'?'Final quote':'Checked'}</div><div>${x.price_updated_at?new Date(x.price_updated_at).toLocaleString():'No successful check recorded'}</div>${x.price_error?`<div class="bad">${esc(x.price_error)}</div>`:''}${x.provider_updated_at?'Provider: '+new Date(x.provider_updated_at*1000).toLocaleString():'Provider time unavailable'}</td></tr>`})}function loadError(e){document.getElementById('priceHealth').textContent='Dashboard update failed: '+e.message+' Displayed values may be stale.'}load().catch(loadError);setInterval(()=>load().catch(loadError),5000)
 </script></body></html>'''
 @app.get('/',response_class=HTMLResponse)
 def home(): return HTML

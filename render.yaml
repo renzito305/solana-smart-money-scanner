@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
@@ -23,3 +23,7 @@ services:
         value: "20"
       - key: PAPER_STOP_LOSS_PCT
         value: "10"
+      - key: PAPER_REFRESH_SECONDS
+        value: "60"
+      - key: PRICE_STALE_SECONDS
+        value: "180"
